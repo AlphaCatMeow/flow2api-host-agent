@@ -16,7 +16,8 @@
 
 ### 仪表盘
 
-![Dashboard](assets/dashboard.png)
+![Uploading PixPin_2026-03-09_15-22-15.png…]()
+
 
 ### 登录向导
 
