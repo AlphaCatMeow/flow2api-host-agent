@@ -145,6 +145,74 @@ def _classify_prewarm_url(url: Optional[str]) -> dict:
     }
 
 
+def _load_last_good(cfg: dict) -> dict:
+    p = Path(cfg.get('last_good_file', '/var/lib/flow2api-host-agent/last_good.json'))
+    try:
+        if p.exists():
+            return json.loads(p.read_text('utf-8'))
+    except Exception:
+        pass
+    return {}
+
+
+def _save_last_good(cfg: dict, data: dict):
+    p = Path(cfg.get('last_good_file', '/var/lib/flow2api-host-agent/last_good.json'))
+    try:
+        ensure_parent(str(p))
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    except Exception:
+        pass
+
+
+def _should_allow_aggressive(cfg: dict) -> bool:
+    """Rate-limit aggressive navigation to avoid bumping the login session."""
+    min_min = int(cfg.get('min_aggressive_interval_minutes', 240) or 240)
+    now = int(time.time())
+    lg = _load_last_good(cfg)
+    last_ts = int(lg.get('last_aggressive_ts') or 0)
+    return (now - last_ts) >= max(0, min_min) * 60
+
+
+def _mark_aggressive_used(cfg: dict):
+    lg = _load_last_good(cfg)
+    lg['last_aggressive_ts'] = int(time.time())
+    _save_last_good(cfg, lg)
+
+
+def _choose_best_st_cookie(cookies: list) -> Optional[str]:
+    """Pick the most likely 'current' session token cookie.
+
+    Prefer:
+    - domain that contains 'labs.google' or 'google'
+    - latest expires
+    - longest value (heuristic)
+    """
+    candidates = [c for c in (cookies or []) if c.get('name') == '__Secure-next-auth.session-token' and c.get('value')]
+    if not candidates:
+        return None
+
+    def score(c):
+        domain = (c.get('domain') or '').lstrip('.').lower()
+        exp = c.get('expires')
+        try:
+            exp = float(exp) if exp is not None else -1
+        except Exception:
+            exp = -1
+        vlen = len(c.get('value') or '')
+        domain_bonus = 0
+        if 'labs.google' in domain:
+            domain_bonus = 3
+        elif 'google' in domain:
+            domain_bonus = 2
+        elif domain:
+            domain_bonus = 1
+        # higher is better
+        return (domain_bonus, exp, vlen)
+
+    best = max(candidates, key=score)
+    return best.get('value')
+
+
 def _collect_cookies_and_st(browser):
     cookies = []
     for ctx in browser.contexts:
@@ -152,11 +220,8 @@ def _collect_cookies_and_st(browser):
             cookies.extend(ctx.cookies())
         except Exception:
             pass
-    st = None
-    for c in cookies:
-        if c.get('name') == '__Secure-next-auth.session-token':
-            st = c.get('value')
-            break
+
+    st = _choose_best_st_cookie(cookies)
     return cookies, st
 
 
@@ -258,13 +323,26 @@ def _aggressive_prewarm(browser, cfg: dict):
 
 def attach_and_get_st(cfg: dict):
     endpoint = f"http://127.0.0.1:{cfg['remote_debugging_port']}"
+    force_aggressive = bool(cfg.get('force_aggressive_prewarm'))
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(endpoint)
         soft_info = _soft_prewarm(browser, cfg)
         cookies, st = _collect_cookies_and_st(browser)
         prewarm_info = soft_info
-        if not st:
+
+        # If force_aggressive_prewarm is enabled, always try a navigation/reload to refresh cookies.
+        if force_aggressive:
             aggressive_info = _aggressive_prewarm(browser, cfg)
+            _mark_aggressive_used(cfg)
+            cookies, st = _collect_cookies_and_st(browser)
+            prewarm_info = aggressive_info
+            prewarm_info['forced'] = True
+            prewarm_info['fallback_from'] = 'soft'
+
+        # Default behavior: only aggressive when no session token present, and rate-limited.
+        if (not st) and (not force_aggressive) and _should_allow_aggressive(cfg):
+            aggressive_info = _aggressive_prewarm(browser, cfg)
+            _mark_aggressive_used(cfg)
             cookies, st = _collect_cookies_and_st(browser)
             prewarm_info = aggressive_info
             prewarm_info['fallback_from'] = 'soft'
@@ -397,6 +475,30 @@ def _run_once_inner(cfg: dict):
     if st:
         result['session_token_masked'] = _mask_token(st)
         result['session_token_fingerprint'] = _token_fingerprint(st)
+
+        # Guardrail: if browser is currently on an abnormal auth/chooser page, do NOT overwrite Flow2API with this ST.
+        # This avoids “fake success” that actually degrades a previously good login session.
+        if page_state.get('is_abnormal'):
+            result['success'] = False
+            result['error'] = 'Abnormal page state; refusing to update token to avoid overwriting a good session'
+            result['skipped_update'] = True
+            lg = _load_last_good(cfg)
+            result['last_good_st_fingerprint'] = lg.get('last_good_st_fingerprint')
+            result['last_good_time'] = lg.get('last_good_time')
+            return result
+
+        # Dedup: if ST fingerprint is unchanged since last known-good, skip updating.
+        lg = _load_last_good(cfg)
+        last_fp = lg.get('last_good_st_fingerprint')
+        if last_fp and last_fp == result['session_token_fingerprint']:
+            # Still healthy: refresh the heartbeat time so watchdog knows we're alive.
+            lg['last_good_time'] = int(time.time())
+            _save_last_good(cfg, lg)
+            result['success'] = True
+            result['skipped_update'] = True
+            result['skip_reason'] = 'st_unchanged'
+            return result
+
         status, body = update_flow2api(cfg, st)
         result['update_status'] = status
         result['update_body'] = body[:2000]
@@ -429,6 +531,13 @@ def _run_once_inner(cfg: dict):
         else:
             result['success'] = bool(api_ok)
             result['warning'] = f"API update succeeded but local verification unavailable: {verify.get('reason')}"
+
+        # Record last-known-good only after we have a successful update.
+        if result.get('success'):
+            lg = _load_last_good(cfg)
+            lg['last_good_st_fingerprint'] = result.get('session_token_fingerprint')
+            lg['last_good_time'] = int(time.time())
+            _save_last_good(cfg, lg)
     else:
         result['success'] = False
         result['error'] = 'No session token found'
