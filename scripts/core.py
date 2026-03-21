@@ -321,6 +321,16 @@ def _aggressive_prewarm(browser, cfg: dict):
     }
 
 
+def _run_aggressive_recovery(browser, cfg: dict, reason: str, force: bool = False):
+    aggressive_info = _aggressive_prewarm(browser, cfg)
+    _mark_aggressive_used(cfg)
+    cookies, st = _collect_cookies_and_st(browser)
+    aggressive_info['fallback_from'] = reason
+    if force:
+        aggressive_info['forced'] = True
+    return cookies, st, aggressive_info
+
+
 def attach_and_get_st(cfg: dict):
     endpoint = f"http://127.0.0.1:{cfg['remote_debugging_port']}"
     force_aggressive = bool(cfg.get('force_aggressive_prewarm'))
@@ -329,23 +339,20 @@ def attach_and_get_st(cfg: dict):
         soft_info = _soft_prewarm(browser, cfg)
         cookies, st = _collect_cookies_and_st(browser)
         prewarm_info = soft_info
+        soft_page_state = (soft_info or {}).get('page_state') or {}
 
         # If force_aggressive_prewarm is enabled, always try a navigation/reload to refresh cookies.
         if force_aggressive:
-            aggressive_info = _aggressive_prewarm(browser, cfg)
-            _mark_aggressive_used(cfg)
-            cookies, st = _collect_cookies_and_st(browser)
-            prewarm_info = aggressive_info
-            prewarm_info['forced'] = True
-            prewarm_info['fallback_from'] = 'soft'
+            cookies, st, prewarm_info = _run_aggressive_recovery(browser, cfg, reason='soft', force=True)
+
+        # If soft prewarm already sees an abnormal auth page, try one controlled recovery pass before giving up.
+        elif soft_page_state.get('is_abnormal') and _should_allow_aggressive(cfg):
+            cookies, st, prewarm_info = _run_aggressive_recovery(browser, cfg, reason='soft_abnormal')
+            prewarm_info['recovery_reason'] = soft_page_state.get('reason') or 'abnormal_page'
 
         # Default behavior: only aggressive when no session token present, and rate-limited.
-        if (not st) and (not force_aggressive) and _should_allow_aggressive(cfg):
-            aggressive_info = _aggressive_prewarm(browser, cfg)
-            _mark_aggressive_used(cfg)
-            cookies, st = _collect_cookies_and_st(browser)
-            prewarm_info = aggressive_info
-            prewarm_info['fallback_from'] = 'soft'
+        elif (not st) and _should_allow_aggressive(cfg):
+            cookies, st, prewarm_info = _run_aggressive_recovery(browser, cfg, reason='soft')
         browser.close()
         return st, cookies, prewarm_info
 
@@ -568,6 +575,30 @@ def run_once(cfg: dict):
     final['attempt_count'] = len(attempts)
     if len(attempts) > 1:
         final['retried'] = True
+
+    recovery_attempt = next(
+        (
+            attempt for attempt in attempts
+            if ((attempt.get('prewarm') or {}).get('fallback_from') == 'soft_abnormal')
+        ),
+        None,
+    )
+    if recovery_attempt:
+        recovery_prewarm = recovery_attempt.get('prewarm') or {}
+        recovery_page = recovery_prewarm.get('page_state') or {}
+        final['recovery_attempted'] = True
+        final['recovery_attempt'] = {
+            'attempt': recovery_attempt.get('attempt'),
+            'strategy': recovery_prewarm.get('strategy'),
+            'mode': recovery_prewarm.get('mode'),
+            'page_url': recovery_prewarm.get('page_url'),
+            'page_state': recovery_page,
+        }
+        if not final.get('success') and recovery_page.get('is_abnormal'):
+            final['prewarm_warning'] = (
+                'Tried aggressive recovery once, but browser still landed on an abnormal auth page: '
+                f"{recovery_page.get('url')}"
+            )
 
     save_json(cfg['state_file'], final)
     return final

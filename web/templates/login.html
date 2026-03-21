@@ -6,9 +6,10 @@
   <title>登录 Google Labs — Flow2API Host Agent</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:system-ui,-apple-system,sans-serif;background:#0b1020;color:#e5e7eb;height:100vh;display:flex;flex-direction:column}
+    body{font-family:system-ui,-apple-system,sans-serif;background:#0b1020;color:#e5e7eb;min-height:100vh;display:flex;flex-direction:column}
     .topbar{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;background:#121933;border-bottom:1px solid #1e2a45;flex-shrink:0}
     .topbar-left{display:flex;align-items:center;gap:12px}
+    .topbar-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
     h1{font-size:1rem;font-weight:600;color:#f1f5f9}
     .badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11px;font-weight:600;background:#064e3b;color:#34d399}
     .badge-err{background:#450a0a;color:#f87171}
@@ -25,9 +26,13 @@
     .guide-num{width:22px;height:22px;border-radius:50%;background:#1e3a5f;color:#60a5fa;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex-shrink:0;margin-top:1px}
     .guide-text{font-size:13px;color:#94a3b8;line-height:1.5}
     .guide-text strong{color:#e2e8f0}
-    .btn{display:inline-flex;align-items:center;padding:9px 16px;border:none;border-radius:8px;font-size:13px;font-weight:500;cursor:pointer;gap:6px;text-decoration:none;width:100%;justify-content:center;margin-top:8px}
+    .btn{display:inline-flex;align-items:center;padding:9px 16px;border:none;border-radius:8px;font-size:13px;font-weight:500;cursor:pointer;gap:6px;text-decoration:none;justify-content:center;margin-top:8px;min-height:44px}
     .btn-primary{background:#3b82f6;color:#fff}.btn-primary:hover{background:#2563eb}
     .btn-secondary{background:#1e293b;color:#cbd5e1;border:1px solid #334155}.btn-secondary:hover{background:#273348}
+    .btn-inline{width:auto;margin-top:0}
+    .sidebar-actions{display:grid;gap:10px}
+    .sidebar-actions form,.sidebar-actions a{width:100%}
+    .sidebar-actions .btn{width:100%;margin-top:0}
     .divider{border:none;border-top:1px solid #1e2a45;margin:16px 0}
     .tip{background:#1e2a45;border-radius:8px;padding:10px 12px;font-size:12px;color:#94a3b8;line-height:1.5;margin-top:12px}
     .tip strong{color:#60a5fa}
@@ -37,7 +42,25 @@
     .vnc-overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#0b1020;z-index:10}
     .vnc-overlay p{color:#64748b;font-size:14px;margin-top:12px}
     .spinner{width:36px;height:36px;border:3px solid #1e2a45;border-top-color:#3b82f6;border-radius:50%;animation:spin 1s linear infinite}
+    .mobile-tip{display:none}
+    .link-note{font-size:12px;color:#64748b;line-height:1.5;margin-top:10px}
+    .link-note code{background:#111a30;border:1px solid #203150;border-radius:8px;padding:2px 6px;color:#cbd5e1}
     @keyframes spin{to{transform:rotate(360deg)}}
+    @media (max-width: 980px){
+      .topbar{flex-direction:column;align-items:flex-start;gap:12px;padding:14px 16px}
+      .topbar-left{flex-wrap:wrap}
+      .topbar-actions{width:100%}
+      .steps{padding:12px 16px}
+      .main{flex-direction:column;overflow:visible}
+      .sidebar{width:100%;border-right:none;border-bottom:1px solid #1e2a45}
+      .vnc-wrap{min-height:70vh}
+      .mobile-tip{display:block}
+    }
+    @media (max-width: 640px){
+      .sidebar{padding:14px}
+      .vnc-wrap{min-height:78vh}
+      iframe{min-height:78vh}
+    }
   </style>
 </head>
 <body>
@@ -49,9 +72,12 @@
       Chrome {{ '运行中' if status.chrome_running else '未运行' }}
     </span>
   </div>
-  <form method="post" action="/action/run-once">
-    <button class="btn btn-primary" type="submit" style="width:auto">⚡ 登录完成，立即刷新 Token</button>
-  </form>
+  <div class="topbar-actions">
+    <a class="btn btn-secondary btn-inline" href="{{ novnc_url }}" target="_blank" rel="noopener">📱 手机全屏打开 noVNC</a>
+    <form method="post" action="/action/run-once">
+      <button class="btn btn-primary btn-inline" type="submit">⚡ 登录完成，立即刷新 Token</button>
+    </form>
+  </div>
 </div>
 
 <div class="steps">
@@ -72,12 +98,23 @@
 
     <hr class="divider">
 
-    <form method="post" action="/action/launch-browser">
-      <button class="btn btn-secondary" type="submit">🔄 重新启动浏览器</button>
-    </form>
+    <div class="sidebar-actions">
+      <a class="btn btn-primary" href="{{ novnc_url }}" target="_blank" rel="noopener">🖥️ 新标签页打开远程桌面</a>
+      <form method="post" action="/action/launch-browser">
+        <button class="btn btn-secondary" type="submit">🔄 重新启动浏览器</button>
+      </form>
+    </div>
 
     <div class="tip">
       <strong>提示：</strong>右侧窗口是你服务器上的浏览器，操作和普通浏览器一样。登录信息保存在本地 Profile，下次无需重新登录。
+    </div>
+
+    <div class="tip mobile-tip">
+      <strong>手机访问建议：</strong>优先点上面的<strong>「新标签页打开远程桌面」</strong>。移动端把 noVNC 塞进 iframe 里，手势和键盘经常互相打架，直接全屏开更顺手。
+    </div>
+
+    <div class="link-note">
+      noVNC 地址：<code>{{ novnc_url }}</code>
     </div>
 
     {% if not health.checks.connection_token_config.ok %}

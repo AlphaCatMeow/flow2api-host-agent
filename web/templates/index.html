@@ -166,7 +166,7 @@
               <p>
                 {% if state.prewarm and state.prewarm.page_state %}
                 预热后落在：<code>{{ state.prewarm.page_state.url }}</code>
-                {% if state.prewarm.page_state.is_abnormal %}<br>这通常意味着浏览器被重定向到登录/授权页，但只要 cookie 还有效，仍可能刷新成功。{% endif %}
+                {% if state.prewarm.page_state.is_abnormal %}<br>这通常意味着浏览器被重定向到登录/授权页。系统会先尝试一次受控恢复；如果恢复后仍异常，就不会覆盖现有 token。{% endif %}
                 {% else %}
                 暂无页面预热信息。
                 {% endif %}

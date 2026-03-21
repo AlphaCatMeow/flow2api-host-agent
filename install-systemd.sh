@@ -131,6 +131,12 @@ if [ -f "$INSTALL_DIR/systemd/flow2api-host-agent-daily-restart.timer" ]; then
   cp "$INSTALL_DIR/systemd/flow2api-host-agent-daily-restart.timer" /etc/systemd/system/
 fi
 
+echo "==> Cleaning legacy watchdog units..."
+for unit in flow2api-host-agent-watchdog.timer flow2api-host-agent-watchdog.service; do
+  systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/$unit"
+done
+
 echo "==> Enabling services..."
 systemctl daemon-reload
 systemctl enable flow2api-host-agent-browser.service
@@ -145,6 +151,7 @@ echo "  flow2api-host-agent-browser  - browser launcher/service (non-root Chromi
 echo "  flow2api-host-agent          - token auto-refresh daemon"
 echo "  flow2api-host-agent-ui       - Web UI on port 38110"
 [ -f "$INSTALL_DIR/systemd/flow2api-host-agent-daily-restart.timer" ] && echo "  flow2api-host-agent-daily-restart.timer - optional daily maintenance restart"
+echo "  (legacy watchdog units are disabled/removed if found)"
 echo ""
 echo "Important:"
 echo "  - Chromium now runs as $SERVICE_USER with sandbox enabled (no --no-sandbox)"
