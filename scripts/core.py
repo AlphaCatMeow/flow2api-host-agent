@@ -4,6 +4,7 @@ import os
 import sqlite3
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from shutil import which
 from typing import Optional
@@ -274,41 +275,31 @@ def _soft_prewarm(browser, cfg: dict):
 
 
 def _aggressive_prewarm(browser, cfg: dict):
-    """Fallback only when no ST is present: navigate/reload Flow page like the extension."""
+    """Open a temporary Flow page like the extension, then close it after cookies settle."""
     start_url = cfg.get('start_url', 'https://labs.google/fx/vi/tools/flow')
     settle_ms = int(cfg.get('prewarm_settle_ms', 5000))
     nav_timeout_ms = int(cfg.get('prewarm_nav_timeout_ms', 45000))
-
-    chosen_page, mode = _find_candidate_page(browser, start_url)
     contexts = list(browser.contexts)
-    if chosen_page is None:
-        if not contexts:
-            raise RuntimeError('No browser contexts available for prewarm')
-        chosen_page = contexts[0].new_page()
-        mode = 'created'
-        chosen_page.goto(start_url, wait_until='load', timeout=nav_timeout_ms)
-    else:
+    if not contexts:
+        raise RuntimeError('No browser contexts available for prewarm')
+
+    temp_page = contexts[0].new_page()
+    page_url = None
+    mode = 'temp_page+goto'
+    try:
+        temp_page.goto(start_url, wait_until='load', timeout=nav_timeout_ms)
         try:
-            chosen_page.bring_to_front()
+            temp_page.wait_for_load_state('networkidle', timeout=min(nav_timeout_ms, 15000))
         except Exception:
             pass
+        time.sleep(max(0, settle_ms) / 1000.0)
+        page_url = getattr(temp_page, 'url', None)
+    finally:
         try:
-            chosen_page.goto(start_url, wait_until='load', timeout=nav_timeout_ms)
-            mode = mode + '+goto'
+            temp_page.close()
         except Exception:
-            try:
-                chosen_page.reload(wait_until='load', timeout=nav_timeout_ms)
-                mode = mode + '+reload'
-            except Exception:
-                mode = mode + '+noop'
+            pass
 
-    try:
-        chosen_page.wait_for_load_state('networkidle', timeout=min(nav_timeout_ms, 15000))
-    except Exception:
-        pass
-
-    time.sleep(max(0, settle_ms) / 1000.0)
-    page_url = getattr(chosen_page, 'url', None)
     return {
         'strategy': 'aggressive',
         'mode': mode,
@@ -331,6 +322,16 @@ def _run_aggressive_recovery(browser, cfg: dict, reason: str, force: bool = Fals
     return cookies, st, aggressive_info
 
 
+def _refresh_st_via_temp_page(cfg: dict):
+    endpoint = f"http://127.0.0.1:{cfg['remote_debugging_port']}"
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(endpoint)
+        prewarm_info = _aggressive_prewarm(browser, cfg)
+        cookies, st = _collect_cookies_and_st(browser)
+        browser.close()
+        return st, cookies, prewarm_info
+
+
 def attach_and_get_st(cfg: dict):
     endpoint = f"http://127.0.0.1:{cfg['remote_debugging_port']}"
     force_aggressive = bool(cfg.get('force_aggressive_prewarm'))
@@ -346,7 +347,7 @@ def attach_and_get_st(cfg: dict):
             cookies, st, prewarm_info = _run_aggressive_recovery(browser, cfg, reason='soft', force=True)
 
         # If soft prewarm already sees an abnormal auth page, try one controlled recovery pass before giving up.
-        elif soft_page_state.get('is_abnormal') and _should_allow_aggressive(cfg):
+        elif soft_page_state.get('is_abnormal'):
             cookies, st, prewarm_info = _run_aggressive_recovery(browser, cfg, reason='soft_abnormal')
             prewarm_info['recovery_reason'] = soft_page_state.get('reason') or 'abnormal_page'
 
@@ -413,8 +414,37 @@ def _candidate_db_paths(cfg: dict):
     return out
 
 
+def _parse_at_expires(value):
+    if not value:
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith('Z'):
+        text = text[:-1] + '+00:00'
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _is_at_still_valid(value, skew_seconds: int = 60):
+    dt = _parse_at_expires(value)
+    if dt is None:
+        return None
+    return dt.timestamp() > (time.time() + max(0, skew_seconds))
+
+
 def _verify_token_written_locally(cfg: dict, email: Optional[str], expected_st: Optional[str]):
-    if not email or not expected_st:
+    if not expected_st:
         return {'available': False, 'verified': False, 'reason': 'missing_email_or_expected_token'}
 
     last_error = None
@@ -426,17 +456,34 @@ def _verify_token_written_locally(cfg: dict, email: Optional[str], expected_st: 
         try:
             con = sqlite3.connect(str(p))
             cur = con.cursor()
-            row = cur.execute(
-                'SELECT id, email, st, at_expires, is_active, current_project_id, current_project_name FROM tokens WHERE email = ? ORDER BY id DESC LIMIT 1',
-                (email,),
-            ).fetchone()
+            lookup_reason = 'email'
+            row = None
+            if email:
+                row = cur.execute(
+                    'SELECT id, email, st, at_expires, is_active, current_project_id, current_project_name FROM tokens WHERE email = ? ORDER BY id DESC LIMIT 1',
+                    (email,),
+                ).fetchone()
+            if not row:
+                lookup_reason = 'st'
+                row = cur.execute(
+                    'SELECT id, email, st, at_expires, is_active, current_project_id, current_project_name FROM tokens WHERE st = ? ORDER BY id DESC LIMIT 1',
+                    (expected_st,),
+                ).fetchone()
             con.close()
             if not row:
-                return {'available': True, 'verified': False, 'db_path': db_path, 'reason': 'email_not_found', 'email': email}
+                return {
+                    'available': True,
+                    'verified': False,
+                    'db_path': db_path,
+                    'reason': 'email_or_st_not_found' if email else 'st_not_found',
+                    'email': email,
+                    'lookup': lookup_reason,
+                }
             token_id, row_email, stored_st, at_expires, is_active, current_project_id, current_project_name = row
             stored_fp = _token_fingerprint(stored_st)
             expected_fp = _token_fingerprint(expected_st)
             matched = stored_st == expected_st
+            at_valid = _is_at_still_valid(at_expires)
             return {
                 'available': True,
                 'verified': matched,
@@ -445,11 +492,13 @@ def _verify_token_written_locally(cfg: dict, email: Optional[str], expected_st: 
                 'email': row_email,
                 'is_active': bool(is_active),
                 'at_expires': at_expires,
+                'at_valid': at_valid,
                 'current_project_id': current_project_id,
                 'current_project_name': current_project_name,
                 'expected_st_fingerprint': expected_fp,
                 'stored_st_fingerprint': stored_fp,
                 'stored_st_masked': _mask_token(stored_st),
+                'lookup': lookup_reason,
                 'reason': 'matched' if matched else 'st_mismatch',
             }
         except Exception as e:
@@ -483,9 +532,10 @@ def _run_once_inner(cfg: dict):
         result['session_token_masked'] = _mask_token(st)
         result['session_token_fingerprint'] = _token_fingerprint(st)
 
-        # Guardrail: if browser is currently on an abnormal auth/chooser page, do NOT overwrite Flow2API with this ST.
-        # This avoids “fake success” that actually degrades a previously good login session.
-        if page_state.get('is_abnormal'):
+        # Guardrail: soft abnormal pages are still too risky to trust.
+        # But when plugin-style temp-page recovery already extracted a fresh ST,
+        # continue and rely on downstream write verification instead of failing early.
+        if page_state.get('is_abnormal') and strategy != 'aggressive':
             result['success'] = False
             result['error'] = 'Abnormal page state; refusing to update token to avoid overwriting a good session'
             result['skipped_update'] = True
@@ -493,18 +543,60 @@ def _run_once_inner(cfg: dict):
             result['last_good_st_fingerprint'] = lg.get('last_good_st_fingerprint')
             result['last_good_time'] = lg.get('last_good_time')
             return result
+        if page_state.get('is_abnormal') and strategy == 'aggressive':
+            result['abnormal_page_policy'] = 'allow_aggressive_sync'
 
         # Dedup: if ST fingerprint is unchanged since last known-good, skip updating.
         lg = _load_last_good(cfg)
         last_fp = lg.get('last_good_st_fingerprint')
         if last_fp and last_fp == result['session_token_fingerprint']:
-            # Still healthy: refresh the heartbeat time so watchdog knows we're alive.
-            lg['last_good_time'] = int(time.time())
-            _save_last_good(cfg, lg)
-            result['success'] = True
-            result['skipped_update'] = True
-            result['skip_reason'] = 'st_unchanged'
-            return result
+            verify = _verify_token_written_locally(cfg, lg.get('last_good_email'), st)
+            result['write_verification'] = verify
+            if verify.get('email'):
+                result['token_email'] = verify.get('email')
+
+            # Only skip the push when Flow2API still has the same ST and the access token
+            # is not known to be expired. Otherwise we fall through and repair the downstream state.
+            if verify.get('available') and verify.get('verified') and verify.get('at_valid') is not False:
+                lg['last_good_time'] = int(time.time())
+                if verify.get('email'):
+                    lg['last_good_email'] = verify.get('email')
+                _save_last_good(cfg, lg)
+                result['success'] = True
+                result['skipped_update'] = True
+                result['skip_reason'] = 'st_unchanged_verified'
+                return result
+
+            result['dedup_repair_required'] = True
+            result['dedup_reason'] = verify.get('reason')
+            result['dedup_at_valid'] = verify.get('at_valid')
+
+            try:
+                repaired_st, repaired_cookies, repaired_prewarm = _refresh_st_via_temp_page(cfg)
+                repaired_fp = _token_fingerprint(repaired_st)
+                result['repair_attempt'] = {
+                    'strategy': (repaired_prewarm or {}).get('strategy'),
+                    'mode': (repaired_prewarm or {}).get('mode'),
+                    'page_url': (repaired_prewarm or {}).get('page_url'),
+                    'page_state': (repaired_prewarm or {}).get('page_state'),
+                    'before_fingerprint': last_fp,
+                    'after_fingerprint': repaired_fp,
+                }
+                if repaired_st and repaired_fp and repaired_fp != result['session_token_fingerprint']:
+                    st = repaired_st
+                    cookies = repaired_cookies
+                    prewarm_info = repaired_prewarm
+                    page_state = (prewarm_info or {}).get('page_state') or {}
+                    strategy = (prewarm_info or {}).get('strategy')
+                    result['cookie_count'] = len(cookies)
+                    result['session_token_masked'] = _mask_token(st)
+                    result['session_token_fingerprint'] = repaired_fp
+                    result['prewarm'] = prewarm_info
+                    result['repair_attempt']['st_changed'] = True
+                else:
+                    result['repair_attempt']['st_changed'] = False
+            except Exception as e:
+                result['repair_attempt_error'] = repr(e)
 
         status, body = update_flow2api(cfg, st)
         result['update_status'] = status
@@ -535,6 +627,11 @@ def _run_once_inner(cfg: dict):
             result['success'] = bool(api_ok and verify.get('verified'))
             if not result['success'] and api_ok and not verify.get('verified'):
                 result['error'] = f"Write verification failed: {verify.get('reason')}"
+            elif result['success'] and verify.get('at_valid') is False:
+                result['warning'] = (
+                    'Session Token 已同步到 Flow2API，但当前 AT 仍然处于过期状态。'
+                    '这通常说明 /api/plugin/update-token 只完成了 ST 同步，没有顺手刷新 AT。'
+                )
         else:
             result['success'] = bool(api_ok)
             result['warning'] = f"API update succeeded but local verification unavailable: {verify.get('reason')}"
@@ -544,6 +641,8 @@ def _run_once_inner(cfg: dict):
             lg = _load_last_good(cfg)
             lg['last_good_st_fingerprint'] = result.get('session_token_fingerprint')
             lg['last_good_time'] = int(time.time())
+            if result.get('token_email'):
+                lg['last_good_email'] = result.get('token_email')
             _save_last_good(cfg, lg)
     else:
         result['success'] = False
